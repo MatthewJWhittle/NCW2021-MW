@@ -1,0 +1,105 @@
+---
+title: "index-changes"
+author: "Matthew Whittle"
+date: "12/09/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(warning = FALSE)
+knitr::opts_chunk$set(message = FALSE)
+
+```
+
+## Load data
+
+```{r}
+rm(list = ls())
+library(tidyverse)
+library(lubridate)
+#library(sf)
+```
+
+```{r}
+files <- list.files("project_data/", pattern = "daily-temp", full.names = TRUE)
+temps <- vroom::vroom(files)
+
+temps <- janitor::clean_names(temps)
+
+head(temps)
+```
+
+The data doesn't have a date column so I'll generate one.
+
+```{r}
+temps <- 
+  temps %>% 
+  mutate(date = glue::glue("{year}-{month}-{day}") %>% lubridate::ymd()
+         )
+
+head(temps)
+```
+
+```{r}
+temps <- 
+  temps %>% 
+  select(region, country, city, date, avg_temperature) 
+
+# For all cities, when does the latest time series begin? i.e. when is the maximum start date?
+temps %>% 
+  group_by(region, country, city) %>% 
+  summarise(first_temp = min(date, na.rm =TRUE)) %>% 
+  ungroup() %>%
+  pull(first_temp) %>% max()
+
+```
+
+```{r}
+index_0 <- ymd("2000-01-01")
+
+# Do all cities have a temp recorded at 2000-01-01?
+temps %>% 
+  mutate(index_date = date %in% index_0) %>%
+  group_by(city) %>% 
+  summarise(has_index_date = any(index_date)) %>% pull(has_index_date) %>% all()
+
+# Some cities have multiple recordings for one day
+index_0 <- 2000
+index_temps  <- 
+  temps %>%
+  filter(avg_temperature > -50) %>%
+  mutate(year = year(date)) %>%
+  filter(year %in% index_0) %>% 
+  group_by(region, country, city) %>%
+  summarise(temp_at_0 = median(avg_temperature))
+
+temp_change <-
+  temps %>%
+  filter(region == "Middle East" & avg_temperature > -50) %>%
+  mutate(year = year(date)) %>%
+  filter(year < 2020) %>%
+  group_by(year, region, country, city) %>%
+  summarise(annual_temp = median(avg_temperature)) %>%
+  left_join(index_temps) %>% 
+  mutate(temp_ind = (annual_temp / temp_at_0) * 100
+         ) 
+
+annual_average <- 
+temp_change %>%
+  group_by(year) %>% 
+  summarise(mean_annual = mean(temp_ind, na.rm = TRUE))
+
+temp_change %>% 
+  ggplot(aes(x = year, y = temp_ind)) +
+  geom_hline(yintercept = 100, linetype = "dashed") +
+  geom_line(alpha = 1, aes(group = city), colour = "pink") +
+  geom_line(data = annual_average, aes(x = year, y = mean_annual), size = 2, alpha = 0.6) + 
+  theme_minimal() + 
+  theme(panel.grid.major.x = element_blank(), 
+        panel.grid.minor.x = element_blank()
+        ) + 
+  labs(x = "Year (1995 - 2019)", y = "Median Temperature Change \n(Index: 100 = Year 2000)")
+
+
+```
