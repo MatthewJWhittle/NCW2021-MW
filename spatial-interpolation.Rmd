@@ -1,0 +1,288 @@
+---
+title: "Spatial Interpolation"
+author: "Matthew Whittle"
+date: "16/09/2021"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(warning =  FALSE)
+knitr::opts_chunk$set(message = FALSE)
+```
+
+# Packages
+
+```{r message = FALSE}
+library(raster)
+library(tidyverse)
+library(sf)
+library(gstat)
+library(sp)
+library(lubridate)
+library(getarc)
+library(janitor)
+library(vroom)
+library(fs)
+library(gridExtra)
+library(leaflet)
+library(leafem)
+library(conflicted)
+  
+conflict_prefer("select", "dplyr")
+conflict_prefer("filter", "dplyr")
+```
+
+# Loading the data
+
+The data is split into 6 csv files, one for each region in the dataset. I'm loading them by listing the files, using the vroom function to read and combine them, then converting the names to 'snake_case'.
+
+> Note: the vroom function loads a representation of the CSVs and doesn't load the whole csv into memory until it is called by R. This is much faster than using `read_csv`.
+
+```{r message = FALSE}
+temps <-
+  # List files
+  fs::dir_ls("project_data/", regexp = "daily*") %>%
+  # Load them into a dataframe
+  vroom::vroom(show_col_types = FALSE) %>% 
+  # tidy the column names
+  janitor::clean_names()
+
+# Preview
+head(temps)
+```
+
+# Data Quality
+
+The data has some quality issues to address. There are some suspect values in the data such as temperatures below -50 and years before 1995. I'm going to fix them with an assumption or convert them to missing values.
+
+```{r}
+set.seed(1)
+year_hist <- 
+  temps %>%
+  slice_sample(n = 10000) %>%
+  ggplot(aes(x = year)) +
+  geom_histogram() + 
+  labs(title = "Year") + 
+  theme_minimal()
+
+temp_hist <- 
+  temps %>%
+  slice_sample(n = 10000) %>%
+  ggplot(aes(x = avg_temperature)) +
+  geom_histogram() + 
+  labs(title = "Avg Temp") +
+  theme_minimal()
+
+grid.arrange(year_hist, temp_hist)
+```
+
+I'm going to assume that days with a value of 0 should be 1; any years before 1995 are errors and should be missing values; and temperatures below -50 should also be missing values. Here I'm using the if_else function to replace suspect values with missing values.
+
+I could solve this problem using interpolation too but I think that is probably beyond the scope of the analysis.
+
+```{r}
+temps <- 
+    temps %>% 
+    mutate(day = if_else(day < 1, 1, day), 
+            year = if_else(year < 1995, NA_real_, year), 
+            avg_temperature = if_else(avg_temperature < -50, NA_real_, avg_temperature)
+            )
+```
+
+# Temperature Summary
+
+```{r}
+library(ggridges)
+temps <- 
+  temps %>% 
+  mutate(date = ymd(glue::glue("{year} {month} {day}")))
+
+index_0 <- ymd("2000-01-01")
+
+# Do all cities have a temp recorded at 2000-01-01?
+temps %>% 
+  mutate(index_date = date %in% index_0) %>%
+  group_by(city) %>% 
+  summarise(has_index_date = any(index_date)) %>% pull(has_index_date) %>% all()
+
+# Some cities have multiple recordings for one day
+index_0 <- 2000
+index_temps  <- 
+  temps %>%
+  mutate(year = year(date)) %>%
+  filter(year %in% index_0) %>% 
+  group_by(region, country, city) %>%
+  summarise(temp_at_0 = median(avg_temperature, na.rm = TRUE))
+
+temp_change <-
+  temps %>%
+  mutate(year = year(date)) %>%
+  group_by(year, region, country, city) %>%
+  summarise(annual_temp = median(avg_temperature, na.rm = TRUE)) %>%
+  left_join(index_temps) %>% 
+  mutate(temp_ind = (annual_temp / temp_at_0) * 100
+         )  %>% 
+  drop_na(temp_ind)
+
+temp_change %>% 
+  filter(year < 2020) %>% 
+  ggplot() + 
+  geom_density_ridges(aes(x = temp_ind, y = as.factor(year))) +
+  theme_ridges() + 
+  theme(legend.position = "none") + 
+  #facet_grid(. ~ region) +
+  labs(x = "Temperature", y = "Year")
+```
+
+# City Locations
+
+I want to model the temperature changes across regions, to do this I'm going to add in a spatial component to the dataset. First I'm going to query a layer of city locations on arcgis online. Then I'll join this into the cities data.
+
+```{r}
+city_xy <- read_csv("project_data/location/city-xy.csv")
+
+city_points <- city_xy %>% st_as_sf(coords = c("longitude", "latitude"), crs = 4326)
+city_points <- city_points %>% st_transform(4326)
+
+world_boundaries <- st_read("project_data/location/world-boundaries.geojson")
+```
+
+```{r}
+leaflet() %>% 
+  addProviderTiles(providers$OpenStreetMap) %>%
+  addFeatures(world_boundaries, popup = ~country) %>%
+  addFeatures(city_points, popup = ~city, color = "pink")
+```
+
+```{r}
+temp_change_pts <- city_points %>% right_join(temp_change)
+```
+
+# Adding Humidity Data
+
+```{r}
+humidity_rasters <- brick("project_data/humidity-monthly-average.grd")
+humidity_points <- stars::read_stars("project_data/humidity-monthly-average.grd") %>% st_as_sf()
+
+city_humidity <- 
+  bind_cols(city_points,
+          humidity_points[st_nearest_feature(city_points, humidity_points), ] %>% st_drop_geometry())
+
+city_humidity <- 
+  city_humidity %>% st_drop_geometry() %>% 
+  pivot_longer(cols = -c(city, region, country, address), names_to = "month", values_to = "average_humidity")
+
+
+temp_hum <- 
+  temps %>% 
+  mutate(month_label = month(date, label = TRUE, abbr = FALSE)) %>% 
+  left_join(city_humidity, by = c("city", "region", "country", "month_label" = "month"))
+head(temp_hum)
+```
+
+# Temperature-Humidity Index
+
+```{r}
+temp_hum <-
+  temp_hum %>%
+  mutate(
+    heat_index =
+      weathermetrics::heat.index(
+        t = avg_temperature,
+        rh  = average_humidity * 100,
+        temperature.metric  = "celcius"
+      ),
+    danger_level = 
+      case_when(heat_index > 51.67 ~ "Extreme Danger",
+                heat_index > 39.44 ~ "Danger",
+                heat_index > 32.22 ~ "Extreme Caution",
+                heat_index > 26.67 ~ "Caution",
+                TRUE ~ "Low Risk")
+  )
+```
+
+# Kriging
+
+```{r}
+temp_ind_2019 <- 
+  temp_change_pts %>% 
+  filter(year == 2019 & complete.cases(temp_ind)) %>% 
+  filter(region != "North America")
+
+head(temp_ind_2019)
+
+
+```
+
+## Making a grid
+
+```{r}
+ep_continents <- "https://services.arcgis.com/P3ePLMYs2RVChkJx/arcgis/rest/services/World_Continents/FeatureServer/0"
+continents <- query_layer(endpoint = ep_continents, in_geometry = st_union(temp_ind_2019))
+continents_region <- continents %>% st_filter(temp_ind_2019) 
+
+world_grid <- st_read("project_data/location/world-grid.geojson")
+world_grid <- world_grid %>% st_transform(crs = 4326)
+world_grid <- world_grid %>% st_filter(continents_region)
+
+plot(continents_region$geometry) 
+plot(temp_ind_2019 %>% select(temp_ind), add = TRUE)
+
+```
+
+## Kriging
+
+```{r}
+
+
+temp_vgm <- variogram(temp_ind ~ 1, temp_ind_2019) # calculates sample variogram values 
+temp_fit <- fit.variogram(temp_vgm, model=vgm(1, "Sph", 900, 1)) # fit model
+temp_kriged <- krige(formula = temp_ind ~ 1, 
+                     temp_ind_2019, 
+                     world_grid, model=temp_fit)
+
+
+```
+
+```{r}
+
+add_coords <-
+  function(x, names = c("x", "y")){
+    xy <- sf::st_coordinates(x)
+    xy <- tibble::as_tibble(xy)
+    colnames(xy) <- names
+    dplyr::bind_cols(x, xy)
+  }
+
+temp_kriged %>%
+  add_coords() %>% 
+  ggplot(aes(x=x, y=y)) + 
+  geom_tile(aes(fill=var1.pred)) + coord_equal() +
+  scale_fill_gradient(low = "yellow", high="red") +
+  scale_x_continuous(labels=scales::comma) + scale_y_continuous(labels=scales::comma) +
+  theme_bw()
+```
+
+```{r}
+
+temp_xyz <- bind_cols(temp_kriged  %>% st_as_sf() %>% st_coordinates(), Z = temp_kriged$var1.pred)
+r <- rasterFromXYZ(as.data.frame(temp_xyz)[, c("X", "Y", "Z")])
+crs(r) <- CRS("EPSG:4326")
+
+plot(r)
+
+max_diff <- max(round(abs(100 - range(raster::values(r), na.rm =TRUE))))
+
+pal_domain <- c(100 - max_diff, 100 + max_diff)
+pal <- colorNumeric(palette = viridis::viridis(3), domain = pal_domain, na.color = NA, alpha = TRUE)
+
+leaflet() %>% 
+  addProviderTiles(providers$OpenStreetMap) %>%
+  #addFeatures(temp_kriged, popup = ~city, color = "grey") %>% 
+  addRasterImage(r, opacity = 1, colors = pal)  %>% 
+  addLegend(pal = pal, values = pal_domain)
+
+```
