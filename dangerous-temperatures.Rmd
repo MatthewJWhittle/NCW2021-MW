@@ -99,7 +99,7 @@ temps <-
   temps %>% 
   mutate(date = ymd(glue::glue("{year} {month} {day}"))) %>% 
   group_by(region, country, city, year, month, day, date) %>% 
-  summarise(avg_temperature = mean(avg_temperature, na.rm = TRUE))
+  slice(1)
 
 head(temps)
 ```
@@ -241,10 +241,6 @@ plot(continents_region$geometry)
 
 ```{r}
 require(automap)
-risk_2019 <- risk_2019 %>% st_transform(crs = 3857) %>% as_Spatial()
-world_grid <- world_grid %>% st_transform(crs = 3857) %>% as_Spatial()
-
-risk_krige <- automap::autoKrige(formula = days ~ 1,input_data = risk_2019, new_data = world_grid)
 
 krige_to_raster <-
   function(krige, crs = 4326) {
@@ -270,47 +266,47 @@ add_coords <-
     colnames(xy) <- names
     dplyr::bind_cols(x, xy)
   }
-
-risk_raster <- krige_to_raster(risk_krige)
-plot(risk_raster)
 ```
 
 # Annual Risk Changes
 
-```{r}
+```{r echo = FALSE}
 years <- c(1995:2019)
-
+world_grid <- world_grid %>% st_transform(3857)
 annual_risk_kriges <-
   map(
     years,
     ~automap::autoKrige(
       formula = days ~ 1,
       input_data = annual_risk_days %>% filter(year == .x) %>% st_transform(3857) %>% as_Spatial(),
-      new_data = world_grid
+      new_data = world_grid %>% as_Spatial()
     )
   ) %>% set_names(paste0("year_", years))
 
-annual_risk_rasters <- annual_risk_kriges %>% map(krige_to_raster)
+#annual_risk_rasters <- annual_risk_kriges %>% map(krige_to_raster)
 
+```
 
+```{r}
 library(viridis)  # better colors for everyone
 library(scales)
 
-plots <-
-  map(
-    annual_risk_kriges,
-    ~ ggplot() +
-      geom_tile(
-        data = .x$krige_output %>%
-          st_as_sf() %>% add_coords(),
-        
-        aes(x, y, fill = var1.pred, colour = var1.pred)
-      ) +
-      coord_equal() +
-      scale_fill_viridis() +
-      scale_colour_viridis()
-  ) %>% set_names(names(annual_risk_kriges))
+map(c(1995, 2017),
+    ~ annual_risk_kriges[[glue::glue("year_{.x}")]]$krige_output %>%
+      st_as_sf() %>%
+      mutate(year = .x)) %>% bind_rows() %>%
+  st_transform(4326) %>%
+  add_coords() %>%
+  ggplot() +
+  geom_tile(
+    aes(x, y, fill = var1.pred, colour = var1.pred)
+  ) +
+  coord_equal() +
+  scale_fill_viridis() +
+  scale_colour_viridis() +
+  facet_grid(year ~ .) + 
+  labs(fill = "Number of Extreme Heat Days") + 
+  guides(colour = FALSE)
 
 
-grid.arrange(plots$year_1995, plots$year_2017)
 ```
