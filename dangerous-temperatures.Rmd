@@ -99,9 +99,55 @@ temps <-
   temps %>% 
   mutate(date = ymd(glue::glue("{year} {month} {day}"))) %>% 
   group_by(region, country, city, year, month, day, date) %>% 
-  slice(1)
+  slice(1) %>% ungroup()
 
 head(temps)
+```
+
+## Complete Time Series
+
+Many cities don't have a full year of data in some years (with all having a partial 2020). This analysis relies on each location having the same number of days per year as it is a comparison of the count of days over a certain temperature threshold. To correct this I will filter out the year 2020 from the analysis and then drop data from cities where there is an incomplete year.
+
+With more time I could address this with interpolation for cities with only a few days missing.
+
+```{r}
+day_counts <- 
+  temps %>%
+  group_by(region, country, city, year) %>% 
+  count(name = "n_days")
+
+day_counts %>% 
+  filter(n_days < 365) %>% 
+  arrange(region, country, city, year)
+```
+
+```{r}
+incomplete_citys <- 
+  day_counts %>% 
+  filter(n_days < 365 & year < 2020) %>% ungroup() %>%
+  arrange(region, country, city) %>%
+  distinct(region, country, city)
+incomplete_citys
+```
+
+```{r}
+day_counts %>% 
+  ggplot(aes(x = n_days, y = year)) + 
+  geom_vline(xintercept = 365, linetype = "dotted", alpha = 0.9) +
+  geom_point(position = position_jitter(width = 0.1, height = 0.1), 
+             alpha  = 1, shape = 21, fill = "lightblue",
+             colour = "grey20", size = 3) + 
+  geom_rug(alpha = 0.7) +
+  theme_minimal() 
+```
+
+Removing data from before 2020 and any cities that don't have a complete time series from 1995 to 2020.
+
+```{r}
+temps  <- 
+  temps %>% 
+  filter(year < 2020) %>% 
+  anti_join(incomplete_citys)
 ```
 
 # City Locations
